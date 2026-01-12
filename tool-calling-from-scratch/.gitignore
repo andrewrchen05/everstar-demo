@@ -1,6 +1,8 @@
 # Environment variables
 .env
 
+conversation_history/
+
 # Python
 __pycache__/
 *.py[cod]
