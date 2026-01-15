@@ -24,7 +24,7 @@ def create_model_provider(client: str, **kwargs) -> ModelProvider:
         environment variable (e.g., GEMINI_API_KEY for Gemini).
     """
     if client.lower() == 'gemini':
-        model_name = kwargs.get('model_name', 'gemini-2.5-flash')
+        model_name = kwargs.get('model_name', 'gemini-3-flash-preview')
         return GeminiModelProvider(model_name=model_name)
     else:
         raise ValueError(f"Unsupported client: {client}. Supported clients: 'gemini'")

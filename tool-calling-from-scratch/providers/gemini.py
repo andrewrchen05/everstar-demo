@@ -25,7 +25,7 @@ class GeminiClient:
     Handles API initialization and message generation.
     """
     
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-3-flash-preview"):
         """
         Initialize the Gemini client.
         
@@ -86,13 +86,36 @@ class GeminiClient:
         # Start a chat session with history
         chat = self.model.start_chat(history=chat_history)
         
-        # Get the last user message for the current prompt
-        user_messages = [msg for msg in messages if msg.role == Role.USER]
-        if not user_messages:
-            raise ValueError("No user messages provided")
+        # Determine what to send as the current prompt
+        # If the last message is an assistant message (tool results), we want to continue from there
+        # Otherwise, use the last user message
+        last_message = messages[-1] if messages else None
+        if not last_message:
+            raise ValueError("No messages provided")
         
-        last_user_message = user_messages[-1]
-        last_user_content = last_user_message.content
+        # If the last message is an assistant message (tool results), use it as the prompt
+        # This enables automatic tool chaining
+        if last_message.role == Role.ASSISTANT:
+            prompt_content = last_message.content
+            # For assistant messages (tool results), we don't have an image_path
+            message_image = None
+        else:
+            # Use the last user message
+            user_messages = [msg for msg in messages if msg.role == Role.USER]
+            if not user_messages:
+                raise ValueError("No user messages provided")
+            
+            last_user_message = user_messages[-1]
+            prompt_content = last_user_message.content
+            # Check for image in the last user message
+            message_image = None
+            if hasattr(last_user_message, 'image_path') and last_user_message.image_path:
+                try:
+                    message_image = Image.open(last_user_message.image_path)
+                except Exception as e:
+                    # If image loading fails, continue without image
+                    print("Image failed to load: ", e)
+                    pass
         
         # Build the prompt with system prompt and tools description if provided
         prompt_parts = []
@@ -107,21 +130,16 @@ class GeminiClient:
         message_parts = []
         
         # If we have system prompt or tools, include them in the message
-        # Otherwise just send the user message
+        # Otherwise just send the prompt content
         if prompt_parts:
-            full_prompt = "\n".join(prompt_parts) + f"\n\nUser: {last_user_content}"
+            full_prompt = "\n".join(prompt_parts) + f"\n\nUser: {prompt_content}"
             message_parts.append(full_prompt)
         else:
-            message_parts.append(last_user_content)
+            message_parts.append(prompt_content)
         
-        # Add image if provided in the last user message
-        if hasattr(last_user_message, 'image_path') and last_user_message.image_path:
-            try:
-                image = Image.open(last_user_message.image_path)
-                message_parts.append(image)
-            except Exception as e:
-                # If image loading fails, continue without image
-                pass
+        # Add image if available
+        if message_image:
+            message_parts.append(message_image)
         
         response = chat.send_message(message_parts)
         
@@ -134,7 +152,7 @@ class GeminiModelProvider(ModelProvider):
     Wraps the GeminiClient class.
     """
     
-    def __init__(self, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, model_name: str = "gemini-3-flash-preview"):
         """
         Initialize the Gemini model provider.
         

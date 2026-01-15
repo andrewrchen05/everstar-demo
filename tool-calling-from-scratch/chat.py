@@ -1,6 +1,7 @@
 # Example Usage
 from core import Agent, Message, Role
 from tools.detect_bounding_box import DetectBoundingBox
+from tools.draw_bounding_box import DrawBoundingBox
 from prompt.system_prompt import SYSTEM_PROMPT
 
 def chat():
@@ -9,9 +10,10 @@ def chat():
     """
     # Initialize agent with optional system prompt
     detect_bbox_tool = DetectBoundingBox()
+    draw_bbox_tool = DrawBoundingBox()
     
     agent = Agent(
-        tools=[detect_bbox_tool],
+        tools=[detect_bbox_tool, draw_bbox_tool],
         system_prompt=SYSTEM_PROMPT
     )
     

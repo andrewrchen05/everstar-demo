@@ -1,4 +1,5 @@
 from typing import List, Optional, Any
+import json
 from .tool import Tool, ToolUse
 from .models import Message, Role, AssistantResponse, ResponseType
 from providers.base import ModelProvider
@@ -35,15 +36,17 @@ class Agent:
             system_message = Message(role=Role.SYSTEM, content=system_prompt)
             self.conversation_history.append(system_message)
     
-    def run(self, messages: List[Message]) -> Message:
+    def run(self, messages: List[Message], max_iterations: int = 10) -> Message:
         """
         Process messages and generate a response.
+        Automatically chains tool calls until a final text response is generated.
         
         Args:
             messages: List of messages in the conversation
+            max_iterations: Maximum number of tool execution iterations to prevent infinite loops (default: 10)
             
         Returns:
-            Message: Assistant's response message
+            Message: Assistant's final response message
         """
         # Start a new conversation if this is the first run
         if not self.logger.current_conversation_id:
@@ -64,63 +67,137 @@ class Agent:
         if not user_messages:
             return Message(role=Role.ASSISTANT, content="I didn't receive any user messages.")
         
-        last_user_message = user_messages[-1]
-        
-        # Generate response (can be text or tool use)
-        assistant_response = self._generate_response(last_user_message.content)
-        
-        # Log the assistant response
-        self.logger.log_response(assistant_response)
-
-        # Check if the response contains a tool use or is a text response
-        if assistant_response.is_text():
-            # Convert text response to Message
-            response = Message(role=Role.ASSISTANT, content=assistant_response.text)
-        elif assistant_response.is_tool_use():
-            # Execute all tools and collect results
-            tool_results = []
-            for tool_use in assistant_response.tool_uses:
-                try:
-                    result = self.execute_tool(tool_use)
-                    tool_results.append(f"{tool_use.name}: {result}")
-                    # Log successful tool execution
-                    self.logger.log_tool_execution(tool_use, result)
-                except Exception as e:
-                    tool_results.append(f"{tool_use.name}: Error - {str(e)}")
-                    # Log failed tool execution
-                    self.logger.log_tool_execution(tool_use, None, error=str(e))
+        # Loop until we get a text response (automatic tool chaining)
+        iteration = 0
+        while iteration < max_iterations:
+            iteration += 1
             
-            # Format tool execution results into a response
-            response_content = "Tool execution results:\n" + "\n".join(tool_results)
-            response = Message(role=Role.ASSISTANT, content=response_content)
-        else:
-            # Fallback
-            response = Message(role=Role.ASSISTANT, content="Unknown response type.")
+            # Generate response based on current conversation history
+            assistant_response = self._generate_response_from_history()
+            
+            # Log the assistant response
+            self.logger.log_response(assistant_response)
+
+            # Check if the response contains a tool use or is a text response
+            if assistant_response.is_text():
+                # Convert text response to Message - this is our final response
+                response = Message(role=Role.ASSISTANT, content=assistant_response.text)
+                self.conversation_history.append(response)
+                self.logger.log_message(response)
+                return response
+                
+            elif assistant_response.is_tool_use():
+                # Execute all tools and collect results
+                tool_results = []
+                for tool_use in assistant_response.tool_uses:
+                    try:
+                        result = self.execute_tool(tool_use)
+                        # Format result in a way that's easy for LLM to parse and reuse
+                        formatted_result = self._format_tool_result(result)
+                        tool_results.append(f"{tool_use.name}: {formatted_result}")
+                        # Log successful tool execution
+                        self.logger.log_tool_execution(tool_use, result)
+                    except Exception as e:
+                        tool_results.append(f"{tool_use.name}: Error - {str(e)}")
+                        # Log failed tool execution
+                        self.logger.log_tool_execution(tool_use, None, error=str(e))
+                
+                # Format tool execution results into a message and add to conversation history
+                # This allows the LLM to see the results and potentially make more tool calls
+                response_content = "Tool execution results:\n" + "\n".join(tool_results)
+                tool_result_message = Message(role=Role.ASSISTANT, content=response_content)
+                self.conversation_history.append(tool_result_message)
+                self.logger.log_message(tool_result_message)
+                
+                # Continue the loop to generate the next response based on tool results
+                continue
+            else:
+                # Fallback - treat as text response
+                response = Message(role=Role.ASSISTANT, content="Unknown response type.")
+                self.conversation_history.append(response)
+                self.logger.log_message(response)
+                return response
         
-        self.conversation_history.append(response)
+        # If we've exceeded max iterations, return an error message
+        error_msg = Message(
+            role=Role.ASSISTANT, 
+            content=f"Maximum tool execution iterations ({max_iterations}) reached. The agent may be stuck in a loop."
+        )
+        self.conversation_history.append(error_msg)
+        self.logger.log_message(error_msg)
+        return error_msg
+    
+    def _generate_response_from_history(self) -> AssistantResponse:
+        """
+        Generate a response based on the current conversation history.
+        Returns an AssistantResponse which can be either text or tool use.
+        The response from Gemini is parsed deterministically to extract tool calls or text.
+        """
+        # Build tools description for the prompt using full tool prompts
+        tools_description = None
+        if self.tools:
+            tool_descriptions = []
+            for tool in self.tools:
+                # Use get_prompt() if available for detailed format examples, otherwise fall back to basic description
+                if hasattr(tool, 'get_prompt'):
+                    tool_descriptions.append(tool.get_prompt())
+                else:
+                    # Fallback to basic description if get_prompt() is not available
+                    tool_desc = f"- {tool.name}: {tool.description}"
+                    if tool.parameters:
+                        params_desc = ", ".join([f"{name}" for name in tool.parameters.keys()])
+                        tool_desc += f" (parameters: {params_desc})"
+                    tool_descriptions.append(tool_desc)
+            tools_description = "\n\n".join(tool_descriptions)
         
-        # Log the final response message
-        self.logger.log_message(response)
+        # Get the last message content for the LLM client
+        # If the last message is an assistant message (tool results), we want to continue from there
+        last_message = self.conversation_history[-1] if self.conversation_history else None
+        if not last_message:
+            return AssistantResponse.text_response("No messages in conversation history.")
         
-        return response
+        # Use the last message content as the prompt
+        # The LLM client will use the full conversation history for context
+        user_input = last_message.content
+        
+        # Call LLM client with full conversation history
+        try:
+            response_text = self.llm_client.generate_response(
+                messages=self.conversation_history,
+                system_prompt=self.system_prompt,
+                tools_description=tools_description
+            )
+        except Exception as e:
+            return AssistantResponse.text_response(f"Error calling LLM API: {str(e)}")
+        
+        # Parse the response deterministically
+        return self._parse_response(response_text)
     
     def _generate_response(self, user_input: str) -> AssistantResponse:
         """
         Generate a response to user input using Gemini API.
+        DEPRECATED: Use _generate_response_from_history() instead for automatic tool chaining.
+        This method is kept for backward compatibility but may not work correctly with tool chaining.
+        
         Returns an AssistantResponse which can be either text or tool use.
         The response from Gemini is parsed deterministically to extract tool calls or text.
         """
-        # Build tools description for the prompt
+        # Build tools description for the prompt using full tool prompts
         tools_description = None
         if self.tools:
-            tools_list = []
+            tool_descriptions = []
             for tool in self.tools:
-                tool_desc = f"- {tool.name}: {tool.description}"
-                if tool.parameters:
-                    params_desc = ", ".join([f"{name}" for name in tool.parameters.keys()])
-                    tool_desc += f" (parameters: {params_desc})"
-                tools_list.append(tool_desc)
-            tools_description = "\n".join(tools_list)
+                # Use get_prompt() if available for detailed format examples, otherwise fall back to basic description
+                if hasattr(tool, 'get_prompt'):
+                    tool_descriptions.append(tool.get_prompt())
+                else:
+                    # Fallback to basic description if get_prompt() is not available
+                    tool_desc = f"- {tool.name}: {tool.description}"
+                    if tool.parameters:
+                        params_desc = ", ".join([f"{name}" for name in tool.parameters.keys()])
+                        tool_desc += f" (parameters: {params_desc})"
+                    tool_descriptions.append(tool_desc)
+            tools_description = "\n\n".join(tool_descriptions)
         
         # Call LLM client
         try:
@@ -281,6 +358,37 @@ class Agent:
         if self.system_prompt:
             system_message = Message(role=Role.SYSTEM, content=self.system_prompt)
             self.conversation_history.append(system_message)
+    
+    def _format_tool_result(self, result: Any) -> str:
+        """
+        Format a tool result in a way that's easy for the LLM to parse and reuse.
+        For structured objects with to_dict(), formats as JSON.
+        For other types, uses string representation.
+        
+        Args:
+            result: The result from tool execution
+            
+        Returns:
+            Formatted string representation of the result
+        """
+        # If the result has a to_dict() method, format as JSON for easy parsing
+        if hasattr(result, 'to_dict'):
+            try:
+                result_dict = result.to_dict()
+                return json.dumps(result_dict, indent=2)
+            except Exception:
+                # Fall back to string representation if to_dict() fails
+                return str(result)
+        
+        # For dicts and lists, format as JSON
+        if isinstance(result, (dict, list)):
+            try:
+                return json.dumps(result, indent=2)
+            except Exception:
+                return str(result)
+        
+        # For other types, use string representation
+        return str(result)
     
     def execute_tool(self, tool_use: ToolUse) -> Any:
         """

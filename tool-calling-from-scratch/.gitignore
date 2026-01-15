@@ -2,6 +2,7 @@
 .env
 
 conversation_history/
+test_outputs/
 
 # Python
 __pycache__/
